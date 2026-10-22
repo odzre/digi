@@ -372,18 +372,20 @@ async function mainMenu() {
         console.log("\n=== MENU UTAMA ===");
         console.log("1. Blacklist Seller");
         console.log("2. Pick Seller");
-        console.log("3. Pilih Produk [oncomming]");
-        console.log(`4. Auto Update Seller [Status: ${statusAuto}]`);
-        console.log("5. Keluar");
+        console.log("3. Add Produk");
+        console.log("4. Auto Bulk Produk");
+        console.log(`5. Auto Update Seller [Status: ${statusAuto}]`);
+        console.log("6. Keluar");
         console.log("\nCredit :\nandikaputra\nodzreshop\n");
 
-        const choice = await askQuestion('> Pilih menu (1/2/3/4/5) : ');
+        const choice = await askQuestion('> Pilih menu (1/2/3/4/5/6) : ');
 
         if (choice === '1') await manageBlacklist();
         else if (choice === '2') await startWizard();
-        else if (choice === '3') console.log("\n[!] Fitur 'Pilih Produk' masih dalam tahap pengembangan (Oncomming).");
-        else if (choice === '4') await manageAutoUpdate();
-        else if (choice === '5') { console.log("\nTerima kasih, sampai jumpa!"); process.exit(0); }
+        else if (choice === '3') await addProductWizard();
+        else if (choice === '4') await autoBulkWizard();
+        else if (choice === '5') await manageAutoUpdate();
+        else if (choice === '6') { console.log("\nTerima kasih, sampai jumpa!"); process.exit(0); }
         else console.log("\n[!] Pilihan tidak valid.");
     }
 }
@@ -704,6 +706,85 @@ async function executeAutoUpdateProcess() {
 }
 
 // ==========================================
+// SELECTION HELPER (with search)
+// ==========================================
+function getBrandId(p) {
+    return p.brand || p.brand_id || p.product_details?.brand?.id || null;
+}
+function getTypeId(p) {
+    return p.type || p.type_id || p.product_details?.type?.id || null;
+}
+
+/**
+ * Helper untuk memilih item dari daftar dengan fitur search.
+ * - Single select: ketik nomor untuk pilih, atau ketik kata kunci untuk filter daftar
+ * - Multi select: ketik nomor (dipisah koma), "0" untuk semua, atau ketik kata kunci search
+ * Returns: item (single) | array items (multi) | null (batal)
+ */
+async function selectWithSearch(items, title, options = {}) {
+    const { isMulti = false, allowAll = false } = options;
+    let currentList = items;
+
+    while (true) {
+        console.log(`\n=== ${title} ===`);
+        if (currentList.length === 0) {
+            console.log("[!] Tidak ada item yang cocok. Kembali ke daftar penuh.");
+            currentList = items;
+            continue;
+        }
+        currentList.forEach((item, idx) => {
+            const name = item.name || item.category_name || item.brand_name || '(tanpa nama)';
+            console.log(`${idx + 1}. ${name}`);
+        });
+        if (allowAll) console.log("  0. Semua");
+
+        const hint = isMulti
+            ? '(nomor koma / ketik search / 0=semua / x=batal)'
+            : '(nomor / ketik search / x=batal)';
+        const input = await askQuestion(`\n> Pilih ${hint} : `);
+        const trimmed = input.trim();
+
+        if (trimmed.toLowerCase() === 'x') return null;
+
+        if (allowAll && trimmed === '0') return [...items];
+
+        // Jika input hanya angka, koma, spasi -> treat sebagai pilihan nomor
+        if (/^[\d,\s]+$/.test(trimmed)) {
+            const indices = trimmed.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+            if (indices.length === 0) {
+                console.log("[!] Input tidak valid.");
+                continue;
+            }
+            if (isMulti) {
+                const invalid = indices.filter(n => n <= 0 || n > currentList.length);
+                if (invalid.length > 0) {
+                    console.log(`[!] Nomor di luar rentang: ${invalid.join(', ')}. Total: ${currentList.length}`);
+                    continue;
+                }
+                const uniqueIndices = [...new Set(indices)];
+                return uniqueIndices.map(n => currentList[n - 1]);
+            } else {
+                const n = indices[0];
+                if (n > 0 && n <= currentList.length) return currentList[n - 1];
+                console.log("[!] Nomor tidak valid.");
+                continue;
+            }
+        }
+
+        // Treat sebagai keyword search
+        const keyword = trimmed.toLowerCase();
+        currentList = items.filter(item => {
+            const name = String(item.name || item.category_name || item.brand_name || '').toLowerCase();
+            return name.includes(keyword);
+        });
+        if (currentList.length === 0) {
+            console.log(`[!] Tidak ada item cocok dengan "${trimmed}".`);
+            currentList = items;
+        }
+    }
+}
+
+// ==========================================
 // BLACKLIST & WIZARD
 // ==========================================
 async function manageBlacklist() {
@@ -735,44 +816,47 @@ async function manageBlacklist() {
 async function startWizard() {
     try {
         const sessionData = await loadSession();
+        if (!sessionData) return console.log("[!] Sesi tidak ditemukan. Harap login terlebih dahulu.");
+
         const { client, jar } = createClient(sessionData);
         const csrf = await getCsrf(jar);
         const headers = digiHeaders(csrf);
         const settings = await loadSettings();
 
-        console.log("\n[~] Mengambil daftar semua kategori...");
+        // === 1. PILIH CATEGORY (with search) ===
+        console.log("\n[~] Mengambil daftar kategori...");
         const catRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/buyer/product/category`, { headers }));
-        const categories = catRes.data.data;
+        const categories = catRes.data?.data || [];
+        if (categories.length === 0) return console.log("[!] Tidak ada kategori tersedia.");
 
-        console.log("\n=== PILIH KATEGORI ===");
-        categories.forEach((cat, idx) => console.log(`${idx + 1}. ${cat.name || cat.category_name}`));
+        const selectedCategory = await selectWithSearch(categories, "PILIH KATEGORI");
+        if (!selectedCategory) return console.log("[!] Dibatalkan.");
+        console.log(`[~] Kategori terpilih: ${selectedCategory.name || selectedCategory.category_name}`);
 
-        let catIdx;
-        while (true) {
-            catIdx = parseInt(await askQuestion('\n> Pilih Kategori (0 untuk batal) : '));
-            if (catIdx === 0) return;
-            if (catIdx > 0 && catIdx <= categories.length) break;
-        }
-        const selectedCategory = categories[catIdx - 1];
-
-        console.log(`\n[~] Mengambil daftar semua brand...`);
+        // === 2. PILIH BRAND (with search) ===
+        console.log("\n[~] Mengambil daftar brand...");
         const brandRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/buyer/product/brand`, { headers }));
-        const brands = brandRes.data.data;
+        const brands = brandRes.data?.data || [];
+        if (brands.length === 0) return console.log("[!] Tidak ada brand tersedia.");
 
-        console.log("\n=== PILIH BRAND ===");
-        brands.forEach((b, idx) => console.log(`${idx + 1}. ${b.name || b.brand_name}`));
+        const selectedBrand = await selectWithSearch(brands, "PILIH BRAND");
+        if (!selectedBrand) return console.log("[!] Dibatalkan.");
+        console.log(`[~] Brand terpilih: ${selectedBrand.name || selectedBrand.brand_name}`);
 
-        let brandIdx;
-        while (true) {
-            brandIdx = parseInt(await askQuestion('\n> Pilih Brand (0 untuk batal) : '));
-            if (brandIdx === 0) return;
-            if (brandIdx > 0 && brandIdx <= brands.length) break;
-        }
-        const selectedBrand = brands[brandIdx - 1];
+        // === 3. PILIH TYPE (multi-select with search) ===
+        console.log("\n[~] Mengambil daftar type...");
+        const typeRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/buyer/product/type`, { headers }));
+        const types = typeRes.data?.data || [];
+        if (types.length === 0) return console.log("[!] Tidak ada type tersedia.");
 
+        const selectedTypes = await selectWithSearch(types, "PILIH TYPE (bisa lebih dari 1)", { isMulti: true, allowAll: true });
+        if (!selectedTypes) return console.log("[!] Dibatalkan.");
+        console.log(`[~] Type terpilih (${selectedTypes.length}): ${selectedTypes.map(t => t.name).join(', ')}`);
+
+        // === 4. PENGATURAN SELLER ===
         console.log(`\n=== PENGATURAN SELLER ===`);
         const ratingInput = await askQuestion('> Minimal Rating (0-5) [default: 4.0] : ');
-        const minRating = ratingInput.trim() !== '' ? parseFloat(ratingInput) : 4.0;
+        const minRating = ratingInput.trim() !== '' && !isNaN(parseFloat(ratingInput)) ? parseFloat(ratingInput) : 4.0;
 
         const ratingQtyInput = await askQuestion('> Minimal Pemberi Rating (jumlah orang, misal 10) [default: 0] : ');
         const minRatingQty = ratingQtyInput.trim() !== '' && !isNaN(parseFloat(ratingQtyInput)) ? parseFloat(ratingQtyInput) : 0;
@@ -784,48 +868,85 @@ async function startWizard() {
         const autoCodeMode = parseCodeMode(codeChoice);
         console.log(`[~] Mode Generate Kode Produk: ${codeModeText(autoCodeMode)}`);
 
-        console.log(`\n[~] Mengambil produk di kategori...`);
+        // === 5. AMBIL & FILTER PRODUK ===
+        console.log(`\n[~] Mengambil produk di kategori "${selectedCategory.name || selectedCategory.category_name}"...`);
         const prodRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/buyer/product/category/${selectedCategory.id}`, { headers }));
+        const allProducts = prodRes.data?.data || [];
 
-        let targetProducts = prodRes.data.data.filter(p => p.brand_id === selectedBrand.id || p.product_details?.brand?.id === selectedBrand.id);
-        if (targetProducts.length === 0) return console.log(`[!] Tidak ada produk untuk brand tersebut.`);
+        const selectedTypeIds = new Set(selectedTypes.map(t => t.id));
+        const brandId = selectedBrand.id;
 
+        const targetProducts = allProducts.filter(p => {
+            const brandMatch = getBrandId(p) === brandId;
+            const typeMatch = selectedTypeIds.has(getTypeId(p));
+            return brandMatch && typeMatch;
+        });
+
+        console.log(`[~] Total produk di kategori : ${allProducts.length}`);
+        console.log(`[~] Produk setelah filter    : ${targetProducts.length}`);
+
+        if (targetProducts.length === 0) return console.log(`[!] Tidak ada produk untuk kombinasi brand & type tersebut.`);
+
+        // === 6. RINGKASAN & KONFIRMASI ===
+        console.log(`\n--- RINGKASAN PICK SELLER ---`);
+        console.log(`  Kategori : ${selectedCategory.name || selectedCategory.category_name}`);
+        console.log(`  Brand    : ${selectedBrand.name || selectedBrand.brand_name}`);
+        console.log(`  Type     : ${selectedTypes.map(t => t.name).join(', ')}`);
+        console.log(`  Min Rating       : ${minRating}`);
+        console.log(`  Min Pemberi Rating: ${minRatingQty}`);
+        console.log(`  Sort             : ${sortPrice}`);
+        console.log(`  Total produk     : ${targetProducts.length}`);
+        console.log(`-----------------------------`);
+
+        console.log("\nDaftar produk yang akan diproses:");
+        targetProducts.forEach((p, idx) => {
+            const pname = p.product || p.name;
+            console.log(`  ${idx + 1}. ${pname}`);
+        });
+
+        const confirm = await askQuestion(`\n> Lanjutkan pick seller untuk ${targetProducts.length} produk? (y/n) : `);
+        if (confirm.trim().toLowerCase() !== 'y') {
+            console.log("[!] Proses dibatalkan.");
+            return;
+        }
+
+        // === 7. PROSES PICK SELLER ===
         const blacklist = await loadBlacklist();
         const lowerBlacklist = blacklist.map(n => n.toLowerCase());
         const skipSellersRuntime = new Set();
 
-        console.log(`\n?? MEMULAI PROSES UPDATE (${targetProducts.length} produk)`);
+        console.log(`\n?? MEMULAI PICK SELLER (${targetProducts.length} produk)\n`);
+
+        let totalSelesai = 0;
+        let totalGagal = 0;
+        let totalSkip = 0;
 
         for (const prod of targetProducts) {
+            const productName = prod.product || prod.name;
+
             try {
                 const sellerRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/buyer/product/seller/${prod.id}`, { headers }));
 
-                // [FIX] Samakan logika filter Wizard dengan Auto Update agar konsisten
-                let sellers = sellerRes.data.data.filter(s => {
+                let sellers = (sellerRes.data?.data || []).filter(s => {
                     const valStatus = String(s.status_sellerSku || '').toUpperCase();
                     const isGangguan = valStatus === 'GANGGUAN' || valStatus === '0' || valStatus === 'FALSE';
-                    // [NEW] Stok 0 dianggap unlimited (tetap lolos), bukan kosong
-                    const isKosong = false;
                     const isActive = s.status === true || String(s.status).toUpperCase() === 'TRUE';
                     const ratingOk = (parseFloat(s.reviewAvg) || 0) >= minRating;
                     const notBlacklisted = !lowerBlacklist.includes(String(s.seller).toLowerCase());
 
-                    // [FIX] Auto-skip seller wajib KTP/faktur pajak + yang sudah ditolak server sebelumnya
                     const sellerDetails = s.seller_details || {};
                     const isFakturWajib = sellerDetails.faturPajak === true || s.faktur === true;
                     const isSkippedRuntime = skipSellersRuntime.has(String(s.seller).toLowerCase());
 
-                    // [NEW] Produk wajib multi (transaksi bisa lebih dari 1x)
                     const isMultiOk = s.multi === true;
-
-                    // [NEW] Minimal jumlah orang pemberi rating (rating_qty "60+" -> 60)
                     const ratingQtyOk = parseRatingQty(s.rating_qty) >= minRatingQty;
 
-                    return !isGangguan && !isKosong && isActive && ratingOk && notBlacklisted && !isFakturWajib && !isSkippedRuntime && isMultiOk && ratingQtyOk;
+                    return !isGangguan && isActive && ratingOk && notBlacklisted && !isFakturWajib && !isSkippedRuntime && isMultiOk && ratingQtyOk;
                 });
 
                 if (sellers.length === 0) {
-                    console.log(`[SKIP] ${prod.product || prod.name} ? Tidak ada seller memenuhi kriteria.`);
+                    totalSkip++;
+                    console.log(`??  [SKIP] ${productName} — Tidak ada seller memenuhi kriteria.`);
                     continue;
                 }
 
@@ -833,13 +954,11 @@ async function startWizard() {
                 else if (sortPrice === 'termahal') sellers.sort((a, b) => b.price - a.price);
                 else sellers.sort(() => Math.random() - 0.5);
 
-                // [FIX] Coba seller satu per satu sampai ada yang berhasil
+                let updateDone = false;
                 for (const chosen of sellers) {
-                    // [FIX] Payload meniru persis body POST dari browser (DevTools).
-                    // seller_sku_code memakai kode asli produk; field teks diberi fallback agar tidak undefined.
                     const updatePayload = {
                         id: prod.id,
-                        code: resolveSkuCode(prod, autoCodeMode || 'off'), // Kode Produk (form "code"), auto-generate sesuai mode
+                        code: resolveSkuCode(prod, autoCodeMode || 'off'),
                         max_price: settings.useMaxPrice ? Number(chosen.price) : 0,
                         product: prod.product || prod.name,
                         product_id: prod.product_id,
@@ -857,7 +976,7 @@ async function startWizard() {
                         seller_sku_id: chosen.id,
                         seller_sku_id_int: Number(chosen.id_int) || 0,
                         seller_connection_type: chosen.connectionType ?? 'api',
-                        seller_sku_code: prod.seller_sku_code, // kode asli produk, bukan kode seller
+                        seller_sku_code: prod.seller_sku_code,
                         seller_details: chosen.seller_details ?? {},
                         status: true,
                         status_sellerSku: chosen.status_sellerSku ?? 1,
@@ -868,43 +987,332 @@ async function startWizard() {
 
                     const skuCode = resolveSkuCode(prod, autoCodeMode || 'off');
                     if (skuCode && skuCode !== (prod.code || '')) {
-                        console.log(`[KODE] "${prod.product || prod.name}" -> Kode Produk dibuat: ${skuCode}`);
+                        console.log(`  ?? [KODE] "${productName}" -> Kode Produk: ${skuCode}`);
                     }
 
                     try {
                         await requestWithRetry(() => client.post(`${DIGI_BASE}/api/v1/buyer/product`, updatePayload, { headers }));
-                        console.log(`[?] FIX: ${prod.product || prod.name} ? ${chosen.seller} (Rp ${chosen.price.toLocaleString('id-ID')})`);
+                        totalSelesai++;
+                        console.log(`? [${totalSelesai}] ${productName} ? ${chosen.seller} (Rp ${Number(chosen.price).toLocaleString('id-ID')})`);
+                        updateDone = true;
                         break;
                     } catch (err) {
                         if (isSessionExpired(err)) {
-                            console.log(`[X] Sesi expired (HTTP ${err.response?.status}). Proses dihentikan, silakan login ulang.`);
+                            console.log(`? Sesi expired (HTTP ${err.response?.status}). Proses dihentikan, silakan login ulang.`);
                             return;
                         }
                         const status = err.response?.status;
                         const msg = String(err.response?.data?.message || '');
-                        // 400 = penolakan bisnis server (mis. seller wajib KTP) -> tandai & coba seller berikutnya
                         if (status === 400) {
-                            console.log(`[SKIP] Seller "${chosen.seller}" ditolak server: ${msg || err.message}. Mencoba seller berikutnya...`);
+                            console.log(`  ??  [SKIP] Seller "${chosen.seller}" ditolak server: ${msg || err.message}. Mencoba seller berikutnya...`);
                             skipSellersRuntime.add(String(chosen.seller).toLowerCase());
                             continue;
                         }
-                        console.log(`[X] Gagal memproses ${prod.product || prod.name}: ${errorDetail(err)}`);
+                        totalGagal++;
+                        console.log(`? [GAGAL] ${productName}: ${errorDetail(err)}`);
                         break;
                     }
                 }
+                if (!updateDone && !skipSellersRuntime.has(String(productName).toLowerCase())) {
+                    totalSkip++;
+                    console.log(`??  [SKIP] ${productName} — Semua kandidat seller ditolak/bermasalah.`);
+                }
             } catch (err) {
                 if (isSessionExpired(err)) {
-                    console.log(`[X] Sesi expired (HTTP ${err.response?.status}). Proses dihentikan, silakan login ulang.`);
+                    console.log(`? Sesi expired (HTTP ${err.response?.status}). Proses dihentikan, silakan login ulang.`);
                     return;
                 }
-                console.log(`[X] Gagal memproses ${prod.product || prod.name}: ${errorDetail(err)}`);
+                totalGagal++;
+                console.log(`? [GAGAL] ${productName}: ${errorDetail(err)}`);
             } finally {
                 await sleep(2000);
             }
         }
-        console.log('\n?? PROSES SELESAI ??\n');
+
+        console.log('\n======================================');
+        console.log(`? PICK SELLER SELESAI | Berhasil: ${totalSelesai} | Skip: ${totalSkip} | Gagal: ${totalGagal}`);
+        console.log('======================================\n');
     } catch (err) {
-        console.log("\n[X] Error:", err.message);
+        console.log(`\n[X] Error: ${err.message}`);
+    }
+}
+
+// ==========================================
+// ADD PRODUK WIZARD
+// ==========================================
+async function addProductWizard() {
+    try {
+        const sessionData = await loadSession();
+        if (!sessionData) return console.log("[!] Sesi tidak ditemukan. Harap login terlebih dahulu.");
+
+        const { client, jar } = createClient(sessionData);
+        const csrf = await getCsrf(jar);
+        const referer = `${DIGI_BASE}/buyer-area/product/add`;
+        const headers = digiHeaders(csrf, referer);
+
+        // === 1. PILIH CATEGORY (with search) ===
+        console.log("\n[~] Mengambil daftar kategori...");
+        const catRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/product/categories/false`, { headers }));
+        const categories = catRes.data?.data || [];
+
+        if (categories.length === 0) return console.log("[!] Tidak ada kategori tersedia.");
+
+        const selectedCategory = await selectWithSearch(categories, "PILIH KATEGORI");
+        if (!selectedCategory) return console.log("[!] Dibatalkan.");
+        console.log(`[~] Kategori terpilih: ${selectedCategory.name}`);
+
+        // === 2. PILIH BRAND (with search) ===
+        console.log("\n[~] Mengambil daftar brand...");
+        const brandRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/product/brands`, { headers }));
+        const brands = brandRes.data?.data || [];
+
+        if (brands.length === 0) return console.log("[!] Tidak ada brand tersedia.");
+
+        const selectedBrand = await selectWithSearch(brands, "PILIH BRAND");
+        if (!selectedBrand) return console.log("[!] Dibatalkan.");
+        console.log(`[~] Brand terpilih: ${selectedBrand.name}`);
+
+        // === 3. PILIH TYPE (multi-select with search) ===
+        console.log("\n[~] Mengambil daftar type...");
+        const typeRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/product/types`, { headers }));
+        const types = typeRes.data?.data || [];
+
+        if (types.length === 0) return console.log("[!] Tidak ada type tersedia.");
+
+        const selectedTypes = await selectWithSearch(types, "PILIH TYPE (bisa lebih dari 1)", { isMulti: true, allowAll: true });
+        if (!selectedTypes) return console.log("[!] Dibatalkan.");
+        console.log(`\n[~] Type terpilih (${selectedTypes.length}): ${selectedTypes.map(t => t.name).join(', ')}`);
+
+        // === 4. MIN SELLER ===
+        const minSellerInput = await askQuestion('\n> Min Seller (minimal total_produk_seller, misal 50) [default: 0] : ');
+        const minSeller = minSellerInput.trim() !== '' && !isNaN(parseInt(minSellerInput)) ? parseInt(minSellerInput) : 0;
+        console.log(`[~] Min Seller: ${minSeller}`);
+
+        // === 5. AMBIL PRODUK BERDASARKAN CATEGORY ===
+        console.log(`\n[~] Mengambil produk di kategori "${selectedCategory.name}"...`);
+        const prodRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/product/buyer/false/${selectedCategory.id}`, { headers }));
+        const allProducts = prodRes.data?.data || [];
+
+        console.log(`[~] Total produk di kategori: ${allProducts.length}`);
+
+        // === 6. FILTER PRODUK ===
+        const selectedTypeIds = new Set(selectedTypes.map(t => t.id));
+
+        const targetProducts = allProducts.filter(p => {
+            const brandMatch = p.brand === selectedBrand.id;
+            const typeMatch = selectedTypeIds.has(p.type);
+            const notAdded = Number(p.total_added) === 0;
+            const sellerOk = Number(p.total_produk_seller || 0) >= minSeller;
+            return brandMatch && typeMatch && notAdded && sellerOk;
+        });
+
+        // Hitung statistik filter untuk info
+        const skipAlreadyAdded = allProducts.filter(p => Number(p.total_added) !== 0).length;
+        const skipLowSeller = allProducts.filter(p =>
+            p.brand === selectedBrand.id &&
+            selectedTypeIds.has(p.type) &&
+            Number(p.total_added) === 0 &&
+            Number(p.total_produk_seller || 0) < minSeller
+        ).length;
+
+        console.log(`\n--- RINGKASAN FILTER ---`);
+        console.log(`  Total produk kategori : ${allProducts.length}`);
+        console.log(`  Skip (sudah ditambah) : ${skipAlreadyAdded}`);
+        console.log(`  Skip (seller < ${minSeller}) : ${skipLowSeller}`);
+        console.log(`  Produk yang akan diadd: ${targetProducts.length}`);
+        console.log(`------------------------`);
+
+        if (targetProducts.length === 0) {
+            console.log("\n[!] Tidak ada produk yang memenuhi kriteria.");
+            return;
+        }
+
+        // === 7. KONFIRMASI ===
+        console.log("\nDaftar produk yang akan ditambahkan:");
+        targetProducts.forEach((p, idx) => {
+            console.log(`  ${idx + 1}. ${p.name} | Seller: ${p.total_produk_seller} | Type: ${p.type}`);
+        });
+
+        const confirm = await askQuestion(`\n> Lanjutkan tambah ${targetProducts.length} produk? (y/n) : `);
+        if (confirm.trim().toLowerCase() !== 'y') {
+            console.log("[!] Proses dibatalkan.");
+            return;
+        }
+
+        // === 8. PROSES ADD PRODUK ===
+        console.log(`\n?? MEMULAI ADD PRODUK (${targetProducts.length} produk)\n`);
+
+        let totalSelesai = 0;
+        let totalGagal = 0;
+
+        for (const prod of targetProducts) {
+            const payload = {
+                id: prod.id,
+                name: prod.name,
+                desc: prod.desc,
+                category: prod.category,
+                brand: prod.brand,
+                type: prod.type,
+                total_added: prod.total_added,
+                total_produk_seller: prod.total_produk_seller,
+                generate_sku_code: false
+            };
+
+            try {
+                await requestWithRetry(() => client.post(`${DIGI_BASE}/api/v1/buyer/product/store/prabayar`, payload, { headers }));
+                totalSelesai++;
+                console.log(`? [${totalSelesai}] ${prod.name} | Seller: ${prod.total_produk_seller}`);
+            } catch (e) {
+                if (isSessionExpired(e)) {
+                    console.log(`? Sesi expired (HTTP ${e.response?.status}). Proses dihentikan, silakan login ulang.`);
+                    return;
+                }
+                totalGagal++;
+                console.log(`? [GAGAL] ${prod.name}: ${errorDetail(e)}`);
+            } finally {
+                await sleep(1000);
+            }
+        }
+
+        console.log('\n======================================');
+        console.log(`? ADD PRODUK SELESAI | Berhasil: ${totalSelesai} | Gagal: ${totalGagal}`);
+        console.log('======================================\n');
+
+    } catch (err) {
+        console.log(`\n[X] Error: ${err.message}`);
+    }
+}
+
+// ==========================================
+// AUTO BULK PRODUK WIZARD
+// ==========================================
+async function autoBulkWizard() {
+    try {
+        const sessionData = await loadSession();
+        if (!sessionData) return console.log("[!] Sesi tidak ditemukan. Harap login terlebih dahulu.");
+
+        const { client, jar } = createClient(sessionData);
+        const csrf = await getCsrf(jar);
+        const referer = `${DIGI_BASE}/buyer-area/product/add`;
+        const headers = digiHeaders(csrf, referer);
+
+        // === 1. PILIH CATEGORY (with search) ===
+        console.log("\n[~] Mengambil daftar kategori...");
+        const catRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/product/categories/false`, { headers }));
+        const categories = catRes.data?.data || [];
+
+        if (categories.length === 0) return console.log("[!] Tidak ada kategori tersedia.");
+
+        const selectedCategory = await selectWithSearch(categories, "PILIH KATEGORI");
+        if (!selectedCategory) return console.log("[!] Dibatalkan.");
+        console.log(`[~] Kategori terpilih: ${selectedCategory.name}`);
+
+        // === 2. PILIH TYPE (multi-select with search) ===
+        console.log("\n[~] Mengambil daftar type...");
+        const typeRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/product/types`, { headers }));
+        const types = typeRes.data?.data || [];
+
+        if (types.length === 0) return console.log("[!] Tidak ada type tersedia.");
+
+        const selectedTypes = await selectWithSearch(types, "PILIH TYPE (bisa lebih dari 1)", { isMulti: true, allowAll: true });
+        if (!selectedTypes) return console.log("[!] Dibatalkan.");
+        console.log(`[~] Type terpilih (${selectedTypes.length}): ${selectedTypes.map(t => t.name).join(', ')}`);
+
+        // === 3. MIN SELLER ===
+        const minSellerInput = await askQuestion('\n> Min Seller (minimal total_produk_seller, misal 50) [default: 0] : ');
+        const minSeller = minSellerInput.trim() !== '' && !isNaN(parseInt(minSellerInput)) ? parseInt(minSellerInput) : 0;
+        console.log(`[~] Min Seller: ${minSeller}`);
+
+        // === 4. AMBIL PRODUK BERDASARKAN CATEGORY ===
+        console.log(`\n[~] Mengambil produk di kategori "${selectedCategory.name}"...`);
+        const prodRes = await requestWithRetry(() => client.get(`${DIGI_BASE}/api/v1/product/buyer/false/${selectedCategory.id}`, { headers }));
+        const allProducts = prodRes.data?.data || [];
+
+        console.log(`[~] Total produk di kategori: ${allProducts.length}`);
+
+        // === 5. FILTER PRODUK ===
+        const selectedTypeIds = new Set(selectedTypes.map(t => t.id));
+
+        const targetProducts = allProducts.filter(p => {
+            const typeMatch = selectedTypeIds.has(p.type);
+            const notAdded = Number(p.total_added) === 0;
+            const sellerOk = Number(p.total_produk_seller || 0) >= minSeller;
+            return typeMatch && notAdded && sellerOk;
+        });
+
+        // Statistik filter
+        const skipAlreadyAdded = allProducts.filter(p => Number(p.total_added) !== 0).length;
+        const skipLowSeller = allProducts.filter(p =>
+            selectedTypeIds.has(p.type) &&
+            Number(p.total_added) === 0 &&
+            Number(p.total_produk_seller || 0) < minSeller
+        ).length;
+
+        console.log(`\n--- RINGKASAN FILTER ---`);
+        console.log(`  Total produk kategori : ${allProducts.length}`);
+        console.log(`  Skip (sudah ditambah) : ${skipAlreadyAdded}`);
+        console.log(`  Skip (seller < ${minSeller}) : ${skipLowSeller}`);
+        console.log(`  Produk yang akan diadd: ${targetProducts.length}`);
+        console.log(`------------------------`);
+
+        if (targetProducts.length === 0) {
+            console.log("\n[!] Tidak ada produk yang memenuhi kriteria.");
+            return;
+        }
+
+        // === 6. KONFIRMASI ===
+        console.log("\nDaftar produk yang akan ditambahkan:");
+        targetProducts.forEach((p, idx) => {
+            console.log(`  ${idx + 1}. ${p.name} | Seller: ${p.total_produk_seller} | Type: ${p.type}`);
+        });
+
+        const confirm = await askQuestion(`\n> Lanjutkan bulk add ${targetProducts.length} produk? (y/n) : `);
+        if (confirm.trim().toLowerCase() !== 'y') {
+            console.log("[!] Proses dibatalkan.");
+            return;
+        }
+
+        // === 7. PROSES BULK ADD ===
+        console.log(`\n?? MEMULAI AUTO BULK PRODUK (${targetProducts.length} produk)\n`);
+
+        let totalSelesai = 0;
+        let totalGagal = 0;
+
+        for (const prod of targetProducts) {
+            const payload = {
+                id: prod.id,
+                name: prod.name,
+                desc: prod.desc,
+                category: prod.category,
+                brand: prod.brand,
+                type: prod.type,
+                total_added: prod.total_added,
+                total_produk_seller: prod.total_produk_seller,
+                generate_sku_code: false
+            };
+
+            try {
+                await requestWithRetry(() => client.post(`${DIGI_BASE}/api/v1/buyer/product/store/prabayar`, payload, { headers }));
+                totalSelesai++;
+                console.log(`? [${totalSelesai}] ${prod.name} | Seller: ${prod.total_produk_seller}`);
+            } catch (e) {
+                if (isSessionExpired(e)) {
+                    console.log(`? Sesi expired (HTTP ${e.response?.status}). Proses dihentikan, silakan login ulang.`);
+                    return;
+                }
+                totalGagal++;
+                console.log(`? [GAGAL] ${prod.name}: ${errorDetail(e)}`);
+            } finally {
+                await sleep(1000);
+            }
+        }
+
+        console.log('\n======================================');
+        console.log(`? AUTO BULK SELESAI | Berhasil: ${totalSelesai} | Gagal: ${totalGagal}`);
+        console.log('======================================\n');
+
+    } catch (err) {
+        console.log(`\n[X] Error: ${err.message}`);
     }
 }
 
